@@ -4,7 +4,7 @@
 
 # K-Vault
 
-> 免费图片/文件托管解决方案，基于 Cloudflare Pages，支持多种存储后端
+> 免费图片/文件托管解决方案，支持 Cloudflare Pages + Docker 双模部署，并兼容多种存储后端
 
 [English](README-EN.md) | **中文**
 
@@ -54,6 +54,11 @@
 - **访客上传** - 可选的访客上传功能，支持文件大小和每日次数限制
 - **多种视图** - 网格、列表、瀑布流多种管理界面
 - **存储分类** - 直观区分不同存储后端的文件
+- **双模部署** - 保留 Cloudflare Pages 部署，同时新增 Docker 自托管（`docker compose up -d`）
+- **动态存储配置管理** - 支持在管理端通过 API 对存储配置进行新增/编辑/删除/测试/设为默认
+- **可插拔设置存储（Docker）** - 基础站点设置可使用 `sqlite`（默认）或 Redis 协议后端（Upstash / Redis / KVrocks）
+- **Vue3 现代前端** - 新增 `/app/` Vue3 前端，同时保留 legacy 页面以兼容旧流程
+- **GitHub Actions 镜像构建** - 主分支/Tag 自动构建并推送 `api` + `web` 镜像
 
 ---
 
@@ -63,6 +68,7 @@
 
 - Cloudflare 账户
 - Telegram 账户（如使用 Telegram 存储）
+- Docker + Docker Compose（可选，用于自托管部署）
 
 ### 第一步：获取 Telegram 凭据
 
@@ -98,6 +104,41 @@
 | `BASIC_PASS` | 管理后台密码 | 可选 |
 
 **重新部署** - 修改环境变量后需重新部署生效
+
+### 第三步：Docker 自托管部署（可选）
+
+如果你希望在自己的 VPS/NAS 上运行（不依赖 Cloudflare Pages 运行时）：
+
+1. 复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+2. 至少填写以下关键变量：
+   - `CONFIG_ENCRYPTION_KEY`
+   - `SESSION_SECRET`
+   - 一套默认存储配置（例如 `TG_BOT_TOKEN` + `TG_CHAT_ID`）
+   - 可选设置存储：
+     - 默认：`SETTINGS_STORE=sqlite`
+     - Redis 模式：`SETTINGS_STORE=redis` 且配置 `SETTINGS_REDIS_URL`
+
+3. 启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+如需启用本地 Redis（用于基础设置存储）：
+```bash
+docker compose --profile redis up -d --build
+```
+
+4. 访问地址：
+   - 兼容旧版页面：`http://<host>:8080/`
+   - Vue3 新版前端：`http://<host>:8080/app/`
+
+完整 Docker 说明请查看 [README-DOCKER.md](README-DOCKER.md)。
 
 ---
 
@@ -330,6 +371,26 @@ curl -X POST "http://127.0.0.1:8081/bot<YOUR_BOT_TOKEN>/setWebhook" \
 | `CHUNK_BACKEND` | 分片临时存储后端（`auto`/`r2`/`kv`） | `auto` |
 | `disable_telemetry` | 禁用遥测 | - |
 
+### Docker 运行时变量（自托管模式）
+
+| 变量名 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `PORT` | 容器内 API 服务端口 | `8787` |
+| `DATA_DIR` | 数据目录 | `/app/data` |
+| `DB_PATH` | SQLite 数据库路径 | `/app/data/k-vault.db` |
+| `CHUNK_DIR` | 分片临时目录 | `/app/data/chunks` |
+| `CONFIG_ENCRYPTION_KEY` | 用于加密存储配置密钥（必填） | - |
+| `SESSION_SECRET` | 会话/签名密钥（建议与加密密钥不同） | - |
+| `UPLOAD_MAX_SIZE` | 最大上传大小（字节） | `104857600` |
+| `UPLOAD_SMALL_FILE_THRESHOLD` | 直传/分片策略阈值（字节） | `20971520` |
+| `CHUNK_SIZE` | 分片大小（字节） | `5242880` |
+| `DEFAULT_STORAGE_TYPE` | 启动时默认存储类型（`telegram`/`r2`/`s3`/`discord`/`huggingface`） | `telegram` |
+| `SETTINGS_STORE` | 基础设置存储后端（`sqlite` 或 `redis`） | `sqlite` |
+| `SETTINGS_REDIS_URL` | Redis URL（Upstash/Redis/KVrocks，`SETTINGS_STORE=redis` 时必填） | - |
+| `SETTINGS_REDIS_PREFIX` | Redis 键前缀 | `k-vault` |
+| `SETTINGS_REDIS_CONNECT_TIMEOUT_MS` | Redis 连接/心跳超时（毫秒） | `5000` |
+| `WEB_PORT` | `docker compose` 对外 Web 端口 | `8080` |
+
 ---
 
 ## 页面说明
@@ -337,6 +398,7 @@ curl -X POST "http://127.0.0.1:8081/bot<YOUR_BOT_TOKEN>/setWebhook" \
 | 页面 | 路径 | 说明 |
 | :--- | :--- | :--- |
 | 首页/上传 | `/` | 批量上传、拖拽、粘贴上传 |
+| Vue3 新版前端 | `/app/` | Vue3 前端（上传/文件管理/存储管理） |
 | 图片浏览 | `/gallery.html` | 图片网格浏览 |
 | 管理后台 | `/admin.html` | 文件管理、黑白名单 |
 | 文件预览 | `/preview.html` | 多格式文件预览 |
@@ -352,6 +414,7 @@ curl -X POST "http://127.0.0.1:8081/bot<YOUR_BOT_TOKEN>/setWebhook" \
 - KV 每日 1,000 次写入、100,000 次读取、1,000 次列出
 - 超出后需升级付费计划（$5/月起）
 - 建议 Telegram 场景开启签名直链或低 KV 写入模式以降低额度压力
+- Docker 自托管模式下，Node 运行时不受 Cloudflare 免费额度限制（受你自己的服务器和存储后端限制）
 
 **各存储后端文件大小限制：**
 
@@ -375,6 +438,8 @@ curl -X POST "http://127.0.0.1:8081/bot<YOUR_BOT_TOKEN>/setWebhook" \
 | :--- | :--- | :---: |
 | `TG_Bot_Token` | Telegram Bot Token | ✅ |
 | `TG_Chat_ID` | Telegram 频道 ID | ✅ |
+| `TG_BOT_TOKEN` | Telegram Bot Token（Docker/自托管命名） | 可选 |
+| `TG_CHAT_ID` | Telegram 频道 ID（Docker/自托管命名） | 可选 |
 | `CUSTOM_BOT_API_URL` | 自部署 Telegram Bot API 地址 | 可选 |
 | `PUBLIC_BASE_URL` | Webhook 回链域名 | 可选 |
 | `TG_WEBHOOK_SECRET` | Telegram Webhook 密钥 | 可选 |
@@ -405,12 +470,29 @@ curl -X POST "http://127.0.0.1:8081/bot<YOUR_BOT_TOKEN>/setWebhook" \
 | `ModerateContentApiKey` | 图片审核 API Key | 可选 |
 | `WhiteList_Mode` | 白名单模式 | 可选 |
 | `disable_telemetry` | 禁用遥测 | 可选 |
+| `PORT` | Docker 自托管模式 API 端口 | 可选 |
+| `DATA_DIR` | Docker 自托管模式数据目录 | 可选 |
+| `DB_PATH` | Docker 自托管模式 SQLite 路径 | 可选 |
+| `CHUNK_DIR` | Docker 自托管模式分片目录 | 可选 |
+| `CONFIG_ENCRYPTION_KEY` | Docker 自托管模式存储配置加密密钥（必填） | 可选 |
+| `SESSION_SECRET` | Docker 自托管模式会话/签名密钥 | 可选 |
+| `UPLOAD_MAX_SIZE` | Docker 自托管模式最大上传大小（字节） | 可选 |
+| `UPLOAD_SMALL_FILE_THRESHOLD` | Docker 自托管模式直传阈值（字节） | 可选 |
+| `CHUNK_SIZE` | Docker 自托管模式分片大小（字节） | 可选 |
+| `DEFAULT_STORAGE_TYPE` | Docker 自托管模式默认存储类型 | 可选 |
+| `SETTINGS_STORE` | Docker 自托管基础设置存储后端（`sqlite`/`redis`） | 可选 |
+| `SETTINGS_REDIS_URL` | Docker 自托管 Redis URL（Upstash/Redis/KVrocks） | 可选 |
+| `SETTINGS_REDIS_PREFIX` | Docker 自托管设置存储 Redis 键前缀 | 可选 |
+| `SETTINGS_REDIS_CONNECT_TIMEOUT_MS` | Docker 自托管 Redis 连接/心跳超时（毫秒） | 可选 |
+| `WEB_PORT` | `docker compose` 对外 Web 端口 | 可选 |
 
 ---
 
 ## 相关链接
 
 - [Cloudflare Pages 文档](https://developers.cloudflare.com/pages/)
+- [Docker 部署说明](README-DOCKER.md)
+- [Docker 镜像工作流](.github/workflows/docker-image.yml)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
 - [Telegram Bot API Server（自部署）](https://github.com/tdlib/telegram-bot-api)
 - [问题反馈](https://github.com/katelya77/K-Vault/issues)
