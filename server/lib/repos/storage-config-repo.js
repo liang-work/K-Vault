@@ -278,6 +278,10 @@ class StorageConfigRepository {
         config: bootstrap.telegram,
         enabled: true,
         isDefault: true,
+        metadata: {
+          source: 'env-bootstrap',
+          envSource: bootstrap.telegram?.envSource || {},
+        },
       });
       return;
     }
@@ -288,6 +292,10 @@ class StorageConfigRepository {
       config: byType,
       enabled: true,
       isDefault: true,
+      metadata: {
+        source: 'env-bootstrap',
+        envSource: byType?.envSource || {},
+      },
     });
   }
 }

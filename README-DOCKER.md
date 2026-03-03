@@ -135,6 +135,25 @@ Direct-link compatibility:
 - Existing `/file/:id` links remain unchanged
 - Signed share links are additive (`/share/:id?...`) and do not break old links
 
+## Cloudflare Pages Without Dashboard Build Settings
+
+If you want Pages to publish the latest `/app/*` UI while keeping dashboard build/output/env/bindings unchanged, use repository workflow:
+
+- `.github/workflows/pages-deploy.yml`
+
+This workflow:
+
+1. builds `frontend/dist` in GitHub Actions
+2. deploys with `wrangler pages deploy`
+3. includes `functions/` via `--functions=functions`
+4. uses `_redirects` so `/app/upload`, `/app/drive`, `/app/storage`, `/app/status` route to the SPA correctly
+
+Required GitHub Secrets:
+
+- `CF_API_TOKEN`
+- `CF_ACCOUNT_ID`
+- `CF_PAGES_PROJECT`
+
 ## Recommended Aggregation Pattern (alist/openlist)
 
 To reduce long-term adapter maintenance, recommended production pattern:

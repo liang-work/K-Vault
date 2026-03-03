@@ -260,6 +260,7 @@ const error = ref('');
 
 const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD = 20 * 1024 * 1024;
+const V2_ACCEPT = 'application/vnd.kvault.v2+json, application/json;q=0.9, text/plain;q=0.5, */*;q=0.1';
 
 const selectedSet = computed(() => new Set(selectedFileIds.value));
 const allSelected = computed(() => files.value.length > 0 && selectedFileIds.value.length === files.value.length);
@@ -545,7 +546,7 @@ async function processQueue() {
           item.error = '';
         } else {
           item.status = 'error';
-          item.error = err.message || 'Upload failed';
+          item.error = humanizeError(err.message || 'Upload failed');
         }
       }
     }
@@ -561,6 +562,59 @@ function apiUrl(path) {
   return `${getApiBase()}${path}`;
 }
 
+function truncate(text, maxLength = 220) {
+  const value = String(text || '');
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function parseJsonSafe(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function humanizeError(message) {
+  const text = String(message || '');
+  const normalized = text.toLowerCase();
+
+  if (normalized.includes('auth_failed') || normalized.includes('unauthorized') || normalized.includes('forbidden')) {
+    return `Authentication failed: ${text}`;
+  }
+  if (normalized.includes('rate') || normalized.includes('too many requests') || normalized.includes('flood')) {
+    return `Rate limited: ${text}`;
+  }
+  if (normalized.includes('quota') || normalized.includes('limit exceeded') || normalized.includes('too large') || normalized.includes('413')) {
+    return `File size or quota exceeded: ${text}`;
+  }
+  if (normalized.includes('network') || normalized.includes('timeout') || normalized.includes('fetch failed')) {
+    return `Network or upstream issue: ${text}`;
+  }
+  if (normalized.includes('not configured')) {
+    return `Storage is not configured: ${text}`;
+  }
+  return text || 'Upload failed';
+}
+
+function resolveUploadErrorMessage(payload, statusCode, rawText = '') {
+  if (payload && typeof payload === 'object') {
+    const nestedMessage = typeof payload?.error?.message === 'string' ? payload.error.message : '';
+    const message = nestedMessage
+      || payload?.error
+      || payload?.message
+      || payload?.errorDetail
+      || payload?.detail;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
+
+  if (rawText) {
+    return `Backend returned non-JSON response (${statusCode}): ${truncate(rawText)}`;
+  }
+  return `Upload failed (${statusCode})`;
+}
+
 function directUpload(item) {
   return new Promise((resolve, reject) => {
     const formData = new FormData();
@@ -572,6 +626,8 @@ function directUpload(item) {
     item.xhr = xhr;
     xhr.open('POST', apiUrl('/upload'));
     xhr.withCredentials = true;
+    xhr.setRequestHeader('Accept', V2_ACCEPT);
+    xhr.setRequestHeader('X-KVault-Client', 'app-v2');
 
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
@@ -580,15 +636,15 @@ function directUpload(item) {
 
     xhr.onload = () => {
       item.xhr = null;
-      let body = {};
-      try {
-        body = JSON.parse(xhr.responseText || '{}');
-      } catch {
-        reject(new Error('Invalid upload response'));
+      const rawText = String(xhr.responseText || '');
+      const body = parseJsonSafe(rawText);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const message = resolveUploadErrorMessage(body, xhr.status, rawText);
+        reject(new Error(humanizeError(message)));
         return;
       }
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(body.error || body.errorDetail || `Upload failed (${xhr.status})`));
+      if (!body) {
+        reject(new Error(`Backend returned non-JSON response: ${truncate(rawText) || '<empty body>'}`));
         return;
       }
       resolve(body);
@@ -613,7 +669,11 @@ async function chunkUpload(item) {
   const totalChunks = Math.ceil(item.file.size / DEFAULT_CHUNK_SIZE);
   const init = await apiFetch('/api/chunked-upload/init', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: V2_ACCEPT,
+      'X-KVault-Client': 'app-v2',
+    },
     body: JSON.stringify({
       fileName: item.file.name,
       fileSize: item.file.size,
@@ -641,6 +701,10 @@ async function chunkUpload(item) {
 
     await apiFetch('/api/chunked-upload/chunk', {
       method: 'POST',
+      headers: {
+        Accept: V2_ACCEPT,
+        'X-KVault-Client': 'app-v2',
+      },
       body,
     });
 
@@ -649,7 +713,11 @@ async function chunkUpload(item) {
 
   await apiFetch('/api/chunked-upload/complete', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: V2_ACCEPT,
+      'X-KVault-Client': 'app-v2',
+    },
     body: JSON.stringify({ uploadId }),
   });
 }
@@ -685,7 +753,11 @@ async function uploadUrl() {
   try {
     await apiFetch('/api/upload-from-url', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: V2_ACCEPT,
+        'X-KVault-Client': 'app-v2',
+      },
       body: JSON.stringify({
         url: urlInput.value,
         storageMode: selectedStorage.value,
@@ -695,7 +767,7 @@ async function uploadUrl() {
     urlInput.value = '';
     await refreshAll();
   } catch (err) {
-    error.value = err.message || 'URL upload failed';
+    error.value = humanizeError(err.message || 'URL upload failed');
   } finally {
     urlUploading.value = false;
   }

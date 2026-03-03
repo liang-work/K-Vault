@@ -1,4 +1,5 @@
-﻿const { Hono } = require('hono');
+const crypto = require('node:crypto');
+const { Hono } = require('hono');
 const { cors } = require('hono/cors');
 const { createContainer } = require('./lib/container');
 const { normalizeFolderPath } = require('./lib/repos/file-repo');
@@ -12,23 +13,88 @@ function createApp() {
   app.use('*', cors({
     origin: (origin) => origin || '*',
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'Range'],
+    allowHeaders: ['Content-Type', 'Authorization', 'Range', 'X-KVault-Client', 'Accept'],
     exposeHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Disposition'],
     credentials: true,
   }));
 
   app.use('*', async (c, next) => {
+    const traceId = crypto.randomUUID();
+    c.set('traceId', traceId);
+    c.header('X-Trace-Id', traceId);
     c.set('container', container);
     try {
       await next();
     } catch (error) {
       console.error(error);
-      return c.json({ error: error.message || 'Internal Server Error' }, 500);
+      const payload = toStorageErrorPayload(error, 500);
+      const envelope = {
+        success: false,
+        error: {
+          code: payload.code || 'INTERNAL_ERROR',
+          message: payload.message || 'Internal Server Error',
+          detail: payload.detail || String(error?.message || 'unknown'),
+          retriable: payload.retriable === true,
+        },
+        traceId,
+      };
+
+      if (prefersV2Envelope(c)) {
+        return c.json(envelope, 500);
+      }
+
+      return c.json({
+        success: false,
+        error: envelope.error.message,
+        errorCode: envelope.error.code,
+        errorDetail: envelope.error.detail,
+        retriable: envelope.error.retriable,
+        traceId,
+      }, 500);
     }
   });
 
   function getServices(c) {
     return c.get('container');
+  }
+
+  function getTraceId(c) {
+    return c.get('traceId') || crypto.randomUUID();
+  }
+
+  function prefersV2Envelope(c) {
+    const client = String(c.req.header('X-KVault-Client') || '').toLowerCase();
+    const accept = String(c.req.header('accept') || '').toLowerCase();
+    return client === 'app-v2' || accept.includes('application/vnd.kvault.v2+json');
+  }
+
+  function jsonError(c, statusCode, code, message, detail, retriable = false, extra = {}) {
+    const traceId = getTraceId(c);
+    const errorInfo = {
+      code: String(code || 'ERROR'),
+      message: String(message || 'Request failed'),
+      detail: String(detail || message || 'Request failed'),
+      retriable: Boolean(retriable),
+    };
+
+    if (prefersV2Envelope(c)) {
+      return c.json({
+        success: false,
+        error: errorInfo,
+        traceId,
+        ...extra,
+      }, statusCode);
+    }
+
+    return c.json({
+      success: false,
+      error: errorInfo.message,
+      errorCode: errorInfo.code,
+      errorDetail: errorInfo.detail,
+      retriable: errorInfo.retriable,
+      traceId,
+      ...extra,
+    }, statusCode);
   }
 
   function asString(value, fallback = '') {
@@ -73,7 +139,7 @@ function createApp() {
   function requireAuth(c) {
     const result = authResult(c);
     if (!result.authenticated) {
-      return c.json({ error: 'Unauthorized' }, 401);
+      return jsonError(c, 401, 'UNAUTHORIZED', 'Authentication required.', result.reason || 'Unauthorized');
     }
     c.set('auth', result);
     return null;
@@ -112,13 +178,31 @@ function createApp() {
       .filter(Boolean);
   }
 
-  function normalizeUploadError(error, fallbackStatus = 500) {
+  function normalizeUploadError(c, error, fallbackStatus = 500) {
     const payload = toStorageErrorPayload(error, error?.status || fallbackStatus);
+    const detail = payload.detail || payload.message || 'Upload failed.';
+    const message = payload.message || 'Upload failed.';
+    const code = payload.code || 'UPLOAD_FAILED';
+    const retriable = payload.retriable === true;
+
+    if (prefersV2Envelope(c)) {
+      return {
+        success: false,
+        error: {
+          code,
+          message,
+          detail,
+          retriable,
+        },
+      };
+    }
+
     return {
-      error: payload.detail || 'Storage operation failed.',
-      errorCode: payload.code,
-      errorDetail: payload.message,
-      retriable: payload.retriable,
+      success: false,
+      error: message,
+      errorCode: code,
+      errorDetail: detail,
+      retriable,
     };
   }
 
@@ -157,6 +241,46 @@ function createApp() {
     return Date.now() + (seconds * 1000);
   }
 
+  function formatStatusDetail(detail) {
+    if (detail == null) return '';
+    if (typeof detail === 'string') return detail;
+    if (detail instanceof Error) return detail.message || String(detail);
+    if (typeof detail === 'object') {
+      if (typeof detail.description === 'string' && detail.description) return detail.description;
+      if (typeof detail.message === 'string' && detail.message) return detail.message;
+      if (typeof detail.error === 'string' && detail.error) return detail.error;
+      try {
+        return JSON.stringify(detail);
+      } catch {
+        return String(detail);
+      }
+    }
+    return String(detail);
+  }
+
+  function uploadSuccessResponse(c, result) {
+    const item = {
+      src: result.src,
+      storageType: result.storage.type,
+      storageId: result.storage.id,
+      fileId: result.file?.id,
+      folderPath: result.file?.metadata?.folderPath || '',
+    };
+
+    if (prefersV2Envelope(c)) {
+      return c.json({
+        success: true,
+        data: {
+          ...item,
+          items: [item],
+        },
+        traceId: getTraceId(c),
+      });
+    }
+
+    return c.json([item]);
+  }
+
   // --- Auth ---
   app.get('/api/auth/check', (c) => {
     const { authService, guestService } = getServices(c);
@@ -182,11 +306,23 @@ function createApp() {
     const password = String(body.password ?? body.pass ?? '');
 
     if (!username || password === '') {
-      return c.json({ success: false, message: 'Missing username or password.' }, 400);
+      return jsonError(
+        c,
+        400,
+        'MISSING_CREDENTIALS',
+        'Missing username or password.',
+        'Provide both username and password.'
+      );
     }
 
     if (username !== container.config.basicUser || password !== container.config.basicPass) {
-      return c.json({ success: false, message: 'Invalid username or password.' }, 401);
+      return jsonError(
+        c,
+        401,
+        'INVALID_CREDENTIALS',
+        'Invalid username or password.',
+        'Credential verification failed.'
+      );
     }
 
     const session = authService.createSession(username);
@@ -296,7 +432,13 @@ function createApp() {
 
     const keys = queryKeys.length > 0 ? queryKeys : payloadKeys;
     if (keys.length === 0) {
-      return c.json({ error: 'No setting keys provided.' }, 400);
+      return jsonError(
+        c,
+        400,
+        'NO_SETTING_KEYS',
+        'No setting keys provided.',
+        'Provide key or keys in query/body.'
+      );
     }
 
     await settingsStore.deleteMany(keys);
@@ -361,7 +503,9 @@ function createApp() {
       metadata: body.metadata,
     });
 
-    if (!updated) return c.json({ error: 'Storage config not found.' }, 404);
+    if (!updated) {
+      return jsonError(c, 404, 'STORAGE_NOT_FOUND', 'Storage config not found.', `Storage config "${id}" does not exist.`);
+    }
 
     return c.json({ success: true, item: storageRepo.getById(id, false) });
   });
@@ -376,10 +520,18 @@ function createApp() {
     try {
       deleted = storageRepo.delete(id);
     } catch (error) {
-      return c.json({ error: error.message }, 409);
+      return jsonError(
+        c,
+        409,
+        'STORAGE_CONFLICT',
+        'Storage config cannot be deleted.',
+        error?.message || 'Storage profile is in use.'
+      );
     }
 
-    if (!deleted) return c.json({ error: 'Storage config not found.' }, 404);
+    if (!deleted) {
+      return jsonError(c, 404, 'STORAGE_NOT_FOUND', 'Storage config not found.', `Storage config "${id}" does not exist.`);
+    }
     return c.json({ success: true });
   });
 
@@ -390,7 +542,9 @@ function createApp() {
     const { storageRepo, storageFactory } = getServices(c);
     const id = c.req.param('id');
     const item = storageRepo.getById(id, true);
-    if (!item) return c.json({ error: 'Storage config not found.' }, 404);
+    if (!item) {
+      return jsonError(c, 404, 'STORAGE_NOT_FOUND', 'Storage config not found.', `Storage config "${id}" does not exist.`);
+    }
 
     try {
       const adapter = storageFactory.createAdapter(item);
@@ -399,6 +553,7 @@ function createApp() {
         ...(result || {}),
       };
       if (!normalized.connected) {
+        normalized.detail = formatStatusDetail(normalized.detail || normalized.raw || 'Connection failed');
         normalized.errorModel = toStorageErrorPayload(normalized.detail || 'Connection failed', normalized.status);
       }
       return c.json({ success: true, result: normalized });
@@ -415,7 +570,9 @@ function createApp() {
     const { storageRepo } = getServices(c);
     const id = c.req.param('id');
     const item = storageRepo.setDefault(id);
-    if (!item) return c.json({ error: 'Storage config not found.' }, 404);
+    if (!item) {
+      return jsonError(c, 404, 'STORAGE_NOT_FOUND', 'Storage config not found.', `Storage config "${id}" does not exist.`);
+    }
 
     return c.json({ success: true, item: storageRepo.getById(id, false) });
   });
@@ -433,6 +590,7 @@ function createApp() {
         ...(result || {}),
       };
       if (!normalized.connected) {
+        normalized.detail = formatStatusDetail(normalized.detail || normalized.raw || 'Connection failed');
         normalized.errorModel = toStorageErrorPayload(normalized.detail || 'Connection failed', normalized.status);
       }
       return c.json({ success: true, result: normalized });
@@ -469,6 +627,7 @@ function createApp() {
       },
       guestUpload: guestService.getConfig(),
       settings: { connected: false, message: 'Unknown' },
+      diagnostics: {},
     };
 
     status.settings = await settingsStore.healthCheck();
@@ -502,6 +661,11 @@ function createApp() {
       try {
         const adapter = storageFactory.createAdapter(storageConfig);
         const result = await adapter.testConnection();
+        const detailText = formatStatusDetail(result.detail || result.raw || '');
+        const errorModel = result.connected
+          ? undefined
+          : toStorageErrorPayload(detailText || 'Connection failed', result.status);
+
         status[type] = {
           connected: Boolean(result.connected),
           enabled: Boolean(result.connected),
@@ -509,10 +673,8 @@ function createApp() {
           layer: status[type]?.layer || 'direct',
           message: result.connected
             ? `Connected (${storageConfig.name})`
-            : (result.detail ? `Connection failed: ${result.detail}` : 'Connection failed'),
-          errorModel: result.connected
-            ? undefined
-            : toStorageErrorPayload(result.detail || 'Connection failed', result.status),
+            : (detailText ? `Connection failed: ${detailText}` : 'Connection failed'),
+          errorModel,
           configName: storageConfig.name,
         };
       } catch (error) {
@@ -527,6 +689,42 @@ function createApp() {
           configName: storageConfig.name,
         };
       }
+    }
+
+    const telegramConfig = byType.telegram;
+    if (telegramConfig) {
+      const envSource = telegramConfig.metadata?.envSource
+        || container.config.bootstrapDefaultStorage?.telegram?.envSource
+        || {};
+      const hasToken = Boolean(telegramConfig.config?.botToken);
+      const hasChatId = Boolean(telegramConfig.config?.chatId);
+      const telegramStatus = status.telegram || {};
+      status.diagnostics.telegram = {
+        summary: telegramStatus.connected
+          ? 'Telegram adapter is connected.'
+          : (telegramStatus.message || 'Telegram adapter is unavailable.'),
+        configName: telegramConfig.name || '',
+        configSource: telegramConfig.metadata?.source || 'dynamic-storage-config',
+        tokenSource: envSource.botToken || 'configured in storage profile',
+        chatIdSource: envSource.chatId || 'configured in storage profile',
+        apiBaseSource: envSource.apiBase || 'configured in storage profile',
+        hasToken,
+        hasChatId,
+      };
+    } else {
+      const envSource = container.config.bootstrapDefaultStorage?.telegram?.envSource || {};
+      const hasToken = Boolean(container.config.bootstrapDefaultStorage?.telegram?.botToken);
+      const hasChatId = Boolean(container.config.bootstrapDefaultStorage?.telegram?.chatId);
+      status.diagnostics.telegram = {
+        summary: 'Telegram storage profile is not created yet.',
+        configName: '',
+        configSource: 'not-configured',
+        tokenSource: envSource.botToken || 'not found',
+        chatIdSource: envSource.chatId || 'not found',
+        apiBaseSource: envSource.apiBase || 'default',
+        hasToken,
+        hasChatId,
+      };
     }
 
     status.capabilities = [
@@ -557,20 +755,26 @@ function createApp() {
     const body = await c.req.parseBody();
     const file = body.file;
     if (!(file instanceof File)) {
-      return c.json({ error: 'No file uploaded.' }, 400);
+      return jsonError(c, 400, 'NO_FILE', 'No file uploaded.', 'Multipart body missing "file".');
     }
 
     const fileBuffer = await file.arrayBuffer();
     const fileSize = fileBuffer.byteLength;
 
     if (fileSize > container.config.uploadMaxSize) {
-      return c.json({ error: `File exceeds upload limit (${Math.floor(container.config.uploadMaxSize / 1024 / 1024)}MB).` }, 413);
+      return jsonError(
+        c,
+        413,
+        'FILE_TOO_LARGE',
+        'File exceeds upload size limit.',
+        `Upload limit is ${Math.floor(container.config.uploadMaxSize / 1024 / 1024)}MB.`
+      );
     }
 
     if (!auth.authenticated) {
       const guestCheck = guestService.checkUploadAllowed(c.req.raw, fileSize);
       if (!guestCheck.allowed) {
-        return c.json({ error: guestCheck.reason }, guestCheck.status || 403);
+        return jsonError(c, guestCheck.status || 403, 'GUEST_REJECTED', 'Guest upload is not allowed.', guestCheck.reason);
       }
     }
 
@@ -586,20 +790,15 @@ function createApp() {
         folderPath: normalizeFolderPath(body.folderPath || body.folder || ''),
       });
     } catch (error) {
-      return c.json(normalizeUploadError(error), 502);
+      const normalized = normalizeUploadError(c, error, 502);
+      return c.json({ ...normalized, traceId: getTraceId(c) }, 502);
     }
 
     if (!auth.authenticated) {
       guestService.incrementUsage(c.req.raw);
     }
 
-    return c.json([{
-      src: result.src,
-      storageType: result.storage.type,
-      storageId: result.storage.id,
-      fileId: result.file?.id,
-      folderPath: result.file?.metadata?.folderPath || '',
-    }]);
+    return uploadSuccessResponse(c, result);
   });
 
   app.post('/api/upload-from-url', async (c) => {
@@ -608,13 +807,13 @@ function createApp() {
     const payload = await c.req.json().catch(() => ({}));
 
     if (!payload.url) {
-      return c.json({ error: 'url is required.' }, 400);
+      return jsonError(c, 400, 'URL_REQUIRED', 'url is required.', 'Missing request body field "url".');
     }
 
     if (!auth.authenticated) {
       const guestCheck = guestService.checkUploadAllowed(c.req.raw, 0);
       if (!guestCheck.allowed) {
-        return c.json({ error: guestCheck.reason }, guestCheck.status || 403);
+        return jsonError(c, guestCheck.status || 403, 'GUEST_REJECTED', 'Guest upload is not allowed.', guestCheck.reason);
       }
     }
 
@@ -628,20 +827,15 @@ function createApp() {
         maxBytes: Math.min(container.config.uploadSmallFileThreshold, container.config.uploadMaxSize),
       });
     } catch (error) {
-      return c.json(normalizeUploadError(error), 502);
+      const normalized = normalizeUploadError(c, error, 502);
+      return c.json({ ...normalized, traceId: getTraceId(c) }, 502);
     }
 
     if (!auth.authenticated) {
       guestService.incrementUsage(c.req.raw);
     }
 
-    return c.json([{
-      src: result.src,
-      storageType: result.storage.type,
-      storageId: result.storage.id,
-      fileId: result.file?.id,
-      folderPath: result.file?.metadata?.folderPath || '',
-    }]);
+    return uploadSuccessResponse(c, result);
   });
 
   // --- Chunk upload ---
@@ -649,7 +843,7 @@ function createApp() {
     const { authService, chunkService } = getServices(c);
     const auth = authService.checkAuthentication(c.req.raw);
     if (!auth.authenticated && authService.isAuthRequired()) {
-      return c.json({ error: 'Guest users cannot use chunk upload.' }, 403);
+      return jsonError(c, 403, 'GUEST_CHUNK_DISABLED', 'Guest users cannot use chunk upload.', 'Login required for chunk uploads.');
     }
 
     const body = await c.req.json().catch(() => ({}));
@@ -657,11 +851,17 @@ function createApp() {
     const totalChunks = Number(body.totalChunks || 0);
 
     if (!body.fileName || !fileSize || !totalChunks) {
-      return c.json({ error: 'Missing required parameters.' }, 400);
+      return jsonError(c, 400, 'MISSING_PARAMS', 'Missing required parameters.', 'fileName, fileSize and totalChunks are required.');
     }
 
     if (fileSize > container.config.uploadMaxSize) {
-      return c.json({ error: `File exceeds upload limit (${Math.floor(container.config.uploadMaxSize / 1024 / 1024)}MB).` }, 400);
+      return jsonError(
+        c,
+        413,
+        'FILE_TOO_LARGE',
+        'File exceeds upload size limit.',
+        `Upload limit is ${Math.floor(container.config.uploadMaxSize / 1024 / 1024)}MB.`
+      );
     }
 
     const init = chunkService.initTask({
@@ -680,10 +880,10 @@ function createApp() {
   app.get('/api/chunked-upload/init', (c) => {
     const { chunkService } = getServices(c);
     const uploadId = c.req.query('uploadId');
-    if (!uploadId) return c.json({ error: 'uploadId is required.' }, 400);
+    if (!uploadId) return jsonError(c, 400, 'UPLOAD_ID_REQUIRED', 'uploadId is required.', 'Query parameter uploadId is missing.');
 
     const task = chunkService.getTask(uploadId);
-    if (!task) return c.json({ error: 'Upload task not found.' }, 404);
+    if (!task) return jsonError(c, 404, 'UPLOAD_TASK_NOT_FOUND', 'Upload task not found.', 'uploadId not found or expired.');
 
     return c.json({ success: true, task });
   });
@@ -699,7 +899,7 @@ function createApp() {
     const chunk = body.chunk;
 
     if (!uploadId || Number.isNaN(chunkIndex) || !(chunk instanceof File)) {
-      return c.json({ error: 'Missing required parameters.' }, 400);
+      return jsonError(c, 400, 'MISSING_PARAMS', 'Missing required parameters.', 'uploadId, chunkIndex and chunk are required.');
     }
 
     const buffer = await chunk.arrayBuffer();
@@ -714,13 +914,14 @@ function createApp() {
     if (unauthorized) return unauthorized;
 
     const body = await c.req.json().catch(() => ({}));
-    if (!body.uploadId) return c.json({ error: 'uploadId is required.' }, 400);
+    if (!body.uploadId) return jsonError(c, 400, 'UPLOAD_ID_REQUIRED', 'uploadId is required.', 'Request body uploadId is missing.');
 
     let result;
     try {
       result = await chunkService.complete(body.uploadId);
     } catch (error) {
-      return c.json(normalizeUploadError(error), 502);
+      const normalized = normalizeUploadError(c, error, 502);
+      return c.json({ ...normalized, traceId: getTraceId(c) }, 502);
     }
 
     return c.json({
@@ -740,7 +941,7 @@ function createApp() {
     const file = fileRepo.getById(id);
 
     if (!file) {
-      return c.json({ error: 'File not found.', fileId: id }, 404);
+      return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`, false, { fileId: id });
     }
 
     return c.json({
@@ -845,12 +1046,12 @@ function createApp() {
     const body = await c.req.json().catch(() => ({}));
     const fileId = asString(body.fileId || body.id).trim();
     if (!fileId) {
-      return c.json({ error: 'fileId is required.' }, 400);
+      return jsonError(c, 400, 'FILE_ID_REQUIRED', 'fileId is required.', 'Provide fileId in request body.');
     }
 
     const file = fileRepo.getById(fileId);
     if (!file) {
-      return c.json({ error: 'File not found.' }, 404);
+      return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${fileId}" does not exist.`);
     }
 
     const expiresAt = parseShareExpiry(body.ttlSeconds || body.expiresIn || body.ttl || undefined);
@@ -974,7 +1175,7 @@ function createApp() {
     const path = normalizeFolderPath(body.path || body.folderPath);
 
     if (!path) {
-      return c.json({ error: 'path is required.' }, 400);
+      return jsonError(c, 400, 'PATH_REQUIRED', 'path is required.', 'Provide path or folderPath.');
     }
 
     const folder = fileRepo.createFolder(path);
@@ -994,7 +1195,13 @@ function createApp() {
     }
 
     if (!sourcePath || !targetPath) {
-      return c.json({ error: 'sourcePath and targetPath are required.' }, 400);
+      return jsonError(
+        c,
+        400,
+        'MOVE_PATHS_REQUIRED',
+        'sourcePath and targetPath are required.',
+        'Provide both sourcePath and targetPath.'
+      );
     }
 
     const result = fileRepo.moveFolder(sourcePath, targetPath);
@@ -1010,7 +1217,7 @@ function createApp() {
     const recursive = isTruthy(c.req.query('recursive'));
 
     if (!path) {
-      return c.json({ error: 'path is required.' }, 400);
+      return jsonError(c, 400, 'PATH_REQUIRED', 'path is required.', 'Provide path query parameter.');
     }
 
     if (recursive) {
@@ -1054,12 +1261,18 @@ function createApp() {
     const fileName = asString(body.fileName || body.name).trim();
 
     if (!id || !fileName) {
-      return c.json({ error: 'id and fileName are required.' }, 400);
+      return jsonError(
+        c,
+        400,
+        'FILE_RENAME_PARAMS_REQUIRED',
+        'id and fileName are required.',
+        'Provide id and fileName in request body.'
+      );
     }
 
     const updated = fileRepo.updateMetadata(id, { fileName });
     if (!updated) {
-      return c.json({ error: 'File not found.' }, 404);
+      return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
     }
 
     return c.json({
@@ -1082,7 +1295,7 @@ function createApp() {
       : [];
 
     if (ids.length === 0) {
-      return c.json({ error: 'ids is required.' }, 400);
+      return jsonError(c, 400, 'IDS_REQUIRED', 'ids is required.', 'Provide at least one file id.');
     }
 
     let deleted = 0;
@@ -1105,7 +1318,7 @@ function createApp() {
     const { fileRepo } = getServices(c);
     const id = decodeURIComponent(c.req.param('id'));
     const file = fileRepo.getById(id);
-    if (!file) return c.json({ success: false, error: 'File not found.' }, 404);
+    if (!file) return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
 
     const updated = fileRepo.updateMetadata(id, { liked: !Boolean(file.liked) });
     return c.json({ success: true, liked: Boolean(updated.liked) });
@@ -1119,9 +1332,9 @@ function createApp() {
     const id = decodeURIComponent(c.req.param('id'));
     const newName = String(c.req.query('newName') || '').trim();
 
-    if (!newName) return c.json({ success: false, error: 'newName is required.' }, 400);
+    if (!newName) return jsonError(c, 400, 'NEW_NAME_REQUIRED', 'newName is required.', 'Provide newName query parameter.');
     const updated = fileRepo.updateMetadata(id, { fileName: newName });
-    if (!updated) return c.json({ success: false, error: 'File not found.' }, 404);
+    if (!updated) return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
 
     return c.json({ success: true, fileName: updated.file_name, key: updated.id });
   });
@@ -1135,7 +1348,7 @@ function createApp() {
     const action = c.req.query('action');
     const nextListType = isTruthy(action) ? 'Block' : 'White';
     const updated = fileRepo.updateMetadata(id, { listType: nextListType });
-    if (!updated) return c.json({ success: false, error: 'File not found.' }, 404);
+    if (!updated) return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
 
     return c.json({ success: true, listType: nextListType, key: updated.id });
   });
@@ -1149,7 +1362,7 @@ function createApp() {
     const action = c.req.query('action');
     const nextListType = isTruthy(action) ? 'White' : 'None';
     const updated = fileRepo.updateMetadata(id, { listType: nextListType });
-    if (!updated) return c.json({ success: false, error: 'File not found.' }, 404);
+    if (!updated) return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
 
     return c.json({ success: true, listType: nextListType, key: updated.id });
   });
@@ -1163,7 +1376,7 @@ function createApp() {
     const result = await uploadService.deleteFile(id);
 
     if (!result.deleted) {
-      return c.json({ success: false, error: 'File not found.' }, 404);
+      return jsonError(c, 404, 'FILE_NOT_FOUND', 'File not found.', `File "${id}" does not exist.`);
     }
 
     return c.json({ success: true, message: 'File deleted.', fileId: id });
@@ -1173,7 +1386,14 @@ function createApp() {
   app.get('/api/bing/wallpaper', async (c) => {
     const response = await fetch('https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=5');
     if (!response.ok) {
-      return c.json({ status: false, message: 'Failed to fetch Bing wallpapers.' }, 502);
+      return jsonError(
+        c,
+        502,
+        'UPSTREAM_BING_FAILED',
+        'Failed to fetch Bing wallpapers.',
+        `Bing upstream returned HTTP ${response.status}.`,
+        true
+      );
     }
     const json = await response.json();
     return c.json({ status: true, message: 'ok', data: json.images || [] });
@@ -1181,7 +1401,14 @@ function createApp() {
   app.get('/api/bing/wallpaper/', async (c) => {
     const response = await fetch('https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=5');
     if (!response.ok) {
-      return c.json({ status: false, message: 'Failed to fetch Bing wallpapers.' }, 502);
+      return jsonError(
+        c,
+        502,
+        'UPSTREAM_BING_FAILED',
+        'Failed to fetch Bing wallpapers.',
+        `Bing upstream returned HTTP ${response.status}.`,
+        true
+      );
     }
     const json = await response.json();
     return c.json({ status: true, message: 'ok', data: json.images || [] });

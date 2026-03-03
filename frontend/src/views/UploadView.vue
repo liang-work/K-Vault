@@ -94,6 +94,7 @@ const urlUploading = ref(false);
 
 const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 const SMALL_FILE_THRESHOLD = 20 * 1024 * 1024;
+const V2_ACCEPT = 'application/vnd.kvault.v2+json, application/json;q=0.9, text/plain;q=0.5, */*;q=0.1';
 
 const modes = computed(() => {
   return STORAGE_TYPES.map((item) => {
@@ -113,7 +114,7 @@ const modes = computed(() => {
 
 const currentStorageLabel = computed(() => {
   const found = modes.value.find((x) => x.value === selectedStorage.value);
-  return found ? found.label : 'Telegram';
+  return found ? found.label : getStorageLabel('telegram');
 });
 
 onMounted(async () => {
@@ -163,6 +164,12 @@ async function processQueue() {
   try {
     for (const item of queue.value) {
       if (item.status !== 'pending') continue;
+      const selected = modes.value.find((mode) => mode.value === selectedStorage.value);
+      if (!selected?.available) {
+        item.status = 'error';
+        item.error = 'Selected storage is unavailable. Open Storage/Status to configure it.';
+        continue;
+      }
       item.status = 'uploading';
       item.error = '';
 
@@ -180,7 +187,7 @@ async function processQueue() {
         });
       } catch (err) {
         item.status = 'error';
-        item.error = err.message || 'Upload failed';
+        item.error = humanizeError(err.message || 'Upload failed');
       }
     }
   } finally {
@@ -196,6 +203,59 @@ function toAbsoluteUrl(path) {
   return new URL(path, window.location.origin).toString();
 }
 
+function truncate(text, maxLength = 220) {
+  const value = String(text || '');
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function parseJsonSafe(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function resolveUploadErrorMessage(payload, statusCode, rawText = '') {
+  if (payload && typeof payload === 'object') {
+    const nestedMessage = typeof payload?.error?.message === 'string' ? payload.error.message : '';
+    const message = nestedMessage
+      || payload?.error
+      || payload?.message
+      || payload?.errorDetail
+      || payload?.detail;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
+
+  if (rawText) {
+    return `Backend returned non-JSON response (${statusCode}): ${truncate(rawText)}`;
+  }
+  return `Upload failed (${statusCode})`;
+}
+
+function humanizeError(message) {
+  const text = String(message || '');
+  const normalized = text.toLowerCase();
+
+  if (normalized.includes('auth_failed') || normalized.includes('unauthorized') || normalized.includes('forbidden')) {
+    return `Authentication failed: ${text}`;
+  }
+  if (normalized.includes('rate') || normalized.includes('too many requests') || normalized.includes('flood')) {
+    return `Rate limited: ${text}`;
+  }
+  if (normalized.includes('quota') || normalized.includes('limit exceeded') || normalized.includes('too large') || normalized.includes('413')) {
+    return `File size or quota exceeded: ${text}`;
+  }
+  if (normalized.includes('network') || normalized.includes('timeout') || normalized.includes('fetch failed')) {
+    return `Network or upstream issue: ${text}`;
+  }
+  if (normalized.includes('not configured')) {
+    return `Storage is not configured: ${text}`;
+  }
+  return text || 'Upload failed';
+}
+
 function directUpload(item) {
   return new Promise((resolve, reject) => {
     const formData = new FormData();
@@ -205,6 +265,8 @@ function directUpload(item) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', apiUrl('/upload'));
     xhr.withCredentials = true;
+    xhr.setRequestHeader('Accept', V2_ACCEPT);
+    xhr.setRequestHeader('X-KVault-Client', 'app-v2');
 
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
@@ -212,22 +274,28 @@ function directUpload(item) {
     };
 
     xhr.onload = () => {
-      try {
-        const body = JSON.parse(xhr.responseText || '{}');
-        if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(body.error || `Upload failed: ${xhr.status}`));
-          return;
-        }
+      const rawText = String(xhr.responseText || '');
+      const body = parseJsonSafe(rawText);
 
-        const src = Array.isArray(body) ? body[0]?.src : body?.src;
-        if (!src) {
-          reject(new Error('Upload response missing src'));
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const message = resolveUploadErrorMessage(body, xhr.status, rawText);
+        reject(new Error(humanizeError(message)));
+        return;
+      }
+
+      const src = Array.isArray(body)
+        ? body[0]?.src
+        : (body?.src || body?.data?.src || body?.data?.items?.[0]?.src || body?.items?.[0]?.src);
+
+      if (!src) {
+        if (!body) {
+          reject(new Error(`Backend returned non-JSON response: ${truncate(rawText) || '<empty body>'}`));
           return;
         }
-        resolve(toAbsoluteUrl(src));
-      } catch (err) {
-        reject(new Error('Invalid upload response'));
+        reject(new Error('Upload response missing src'));
+        return;
       }
+      resolve(toAbsoluteUrl(src));
     };
 
     xhr.onerror = () => reject(new Error('Network error'));
@@ -240,7 +308,11 @@ async function chunkUpload(item) {
 
   const init = await apiFetch('/api/chunked-upload/init', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: V2_ACCEPT,
+      'X-KVault-Client': 'app-v2',
+    },
     body: JSON.stringify({
       fileName: item.file.name,
       fileSize: item.file.size,
@@ -265,6 +337,10 @@ async function chunkUpload(item) {
 
     await apiFetch('/api/chunked-upload/chunk', {
       method: 'POST',
+      headers: {
+        Accept: V2_ACCEPT,
+        'X-KVault-Client': 'app-v2',
+      },
       body: chunkBody,
     });
 
@@ -273,7 +349,11 @@ async function chunkUpload(item) {
 
   const done = await apiFetch('/api/chunked-upload/complete', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: V2_ACCEPT,
+      'X-KVault-Client': 'app-v2',
+    },
     body: JSON.stringify({ uploadId }),
   });
 
@@ -286,6 +366,11 @@ async function chunkUpload(item) {
 
 async function uploadUrl() {
   if (!urlInput.value || urlUploading.value) return;
+  const selected = modes.value.find((mode) => mode.value === selectedStorage.value);
+  if (!selected?.available) {
+    error.value = 'Selected storage is unavailable. Open Storage/Status to configure it.';
+    return;
+  }
 
   urlUploading.value = true;
   error.value = '';
@@ -293,7 +378,11 @@ async function uploadUrl() {
   try {
     const body = await apiFetch('/api/upload-from-url', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: V2_ACCEPT,
+        'X-KVault-Client': 'app-v2',
+      },
       body: JSON.stringify({
         url: urlInput.value,
         storageMode: selectedStorage.value,
@@ -313,7 +402,7 @@ async function uploadUrl() {
 
     urlInput.value = '';
   } catch (err) {
-    error.value = err.message || 'URL upload failed';
+    error.value = humanizeError(err.message || 'URL upload failed');
   } finally {
     urlUploading.value = false;
   }

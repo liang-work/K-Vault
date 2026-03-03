@@ -60,9 +60,16 @@ class TelegramStorageAdapter {
     this.validate();
     const response = await fetch(buildBotApiUrl(this.config, 'getMe'));
     const json = await response.json().catch(() => ({}));
+    const detail = typeof json?.description === 'string' && json.description
+      ? json.description
+      : (typeof json?.message === 'string' && json.message ? json.message : '');
+
     return {
       connected: Boolean(response.ok && json.ok),
-      detail: json,
+      status: response.status,
+      detail: detail || (json?.ok ? 'ok' : 'Telegram API request failed'),
+      raw: json,
+      botUsername: json?.result?.username || '',
     };
   }
 

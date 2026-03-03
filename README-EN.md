@@ -70,6 +70,21 @@
 - Storage capability cards now keep all adapters visible (configured or not) with explicit status/hints.
 - Existing direct links (`/file/:id`) remain compatible.
 
+### Cloudflare Pages (No Dashboard Build Setting Changes)
+
+A CI deployment path is included in `.github/workflows/pages-deploy.yml`.
+
+- Build runs in GitHub Actions (`frontend/dist`).
+- Deployment uses `wrangler pages deploy`.
+- Functions are included with `--functions=functions`.
+- `_redirects` keeps SPA routes (`/app/upload`, `/app/drive`, `/app/storage`, `/app/status`) working.
+
+Required repository secrets:
+
+- `CF_API_TOKEN`
+- `CF_ACCOUNT_ID`
+- `CF_PAGES_PROJECT`
+
 Recommended architecture for multi-cloud mounts:
 
 - Use `WebDAV` adapter in K-Vault as a mounted entry.

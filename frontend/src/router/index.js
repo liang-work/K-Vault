@@ -5,6 +5,7 @@ import LoginView from '../views/LoginView.vue';
 import UploadView from '../views/UploadView.vue';
 import DriveView from '../views/DriveView.vue';
 import StorageView from '../views/StorageView.vue';
+import StatusView from '../views/StatusView.vue';
 
 const routes = [
   {
@@ -22,6 +23,7 @@ const routes = [
       { path: 'drive', name: 'drive', component: DriveView, meta: { requiresAdmin: true } },
       { path: 'admin', redirect: '/drive' },
       { path: 'storage', name: 'storage', component: StorageView, meta: { requiresAdmin: true } },
+      { path: 'status', name: 'status', component: StatusView },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/upload' },

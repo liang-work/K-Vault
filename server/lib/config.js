@@ -17,10 +17,23 @@ function resolveDataPath(...parts) {
   return path.resolve(process.cwd(), ...parts);
 }
 
+function pickEnvAlias(env, aliases = [], fallback = '') {
+  for (const alias of aliases) {
+    const value = env[alias];
+    if (value != null && String(value).trim() !== '') {
+      return { value, source: alias };
+    }
+  }
+  return { value: fallback, source: '' };
+}
+
 function loadConfig(env = process.env) {
   const dataDir = env.DATA_DIR
     ? path.resolve(env.DATA_DIR)
     : resolveDataPath('data');
+  const telegramToken = pickEnvAlias(env, ['TG_BOT_TOKEN', 'TG_Bot_Token']);
+  const telegramChatId = pickEnvAlias(env, ['TG_CHAT_ID', 'TG_Chat_ID']);
+  const telegramApiBase = pickEnvAlias(env, ['CUSTOM_BOT_API_URL'], 'https://api.telegram.org');
 
   return {
     port: toInt(env.PORT, 8787),
@@ -51,15 +64,20 @@ function loadConfig(env = process.env) {
     settingsRedisPrefix: env.SETTINGS_REDIS_PREFIX || 'k-vault',
     settingsRedisConnectTimeoutMs: toInt(env.SETTINGS_REDIS_CONNECT_TIMEOUT_MS, 5000),
 
-    telegramApiBase: env.CUSTOM_BOT_API_URL || 'https://api.telegram.org',
+    telegramApiBase: telegramApiBase.value,
 
     // Optional bootstrap default storage from env.
     bootstrapDefaultStorage: {
       type: (env.DEFAULT_STORAGE_TYPE || 'telegram').toLowerCase(),
       telegram: {
-        botToken: env.TG_Bot_Token || env.TG_BOT_TOKEN || '',
-        chatId: env.TG_Chat_ID || env.TG_CHAT_ID || '',
-        apiBase: env.CUSTOM_BOT_API_URL || 'https://api.telegram.org',
+        botToken: telegramToken.value || '',
+        chatId: telegramChatId.value || '',
+        apiBase: telegramApiBase.value || 'https://api.telegram.org',
+        envSource: {
+          botToken: telegramToken.source || 'none',
+          chatId: telegramChatId.source || 'none',
+          apiBase: telegramApiBase.source || 'default',
+        },
       },
       r2: {
         endpoint: env.R2_ENDPOINT || env.S3_ENDPOINT || '',

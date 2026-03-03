@@ -835,6 +835,25 @@ textarea {
   gap: 6px;
 }
 
+.status-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.diagnostic-card {
+  display: grid;
+  gap: 8px;
+}
+
+.diag-list,
+.diag-steps {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-soft);
+  display: grid;
+  gap: 4px;
+}
+
 @media (max-width: 960px) {
   .app-bg {
     width: calc(100% - 20px);

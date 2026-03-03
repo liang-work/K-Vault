@@ -12,9 +12,19 @@
         <router-link class="nav-link" to="/upload">Upload</router-link>
         <router-link class="nav-link" to="/drive">Drive</router-link>
         <router-link class="nav-link" to="/storage">Storage</router-link>
-        <a class="nav-link" href="/index.html" target="_blank" rel="noopener">Legacy</a>
+        <router-link class="nav-link" to="/status">Status</router-link>
+        <a class="nav-link" href="/legacy/index.html" target="_blank" rel="noopener">Legacy</a>
       </nav>
-      <button v-if="authStore.authenticated" class="btn btn-ghost" @click="handleLogout">Logout</button>
+      <div class="toolbar">
+        <router-link
+          v-if="authStore.authRequired && !authStore.authenticated"
+          class="btn btn-ghost"
+          to="/login"
+        >
+          Login
+        </router-link>
+        <button v-if="authStore.authenticated" class="btn btn-ghost" @click="handleLogout">Logout</button>
+      </div>
     </header>
 
     <section v-if="authStore.guestMode" class="guest-note card">
